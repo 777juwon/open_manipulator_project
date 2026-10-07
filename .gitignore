@@ -534,3 +534,6 @@ doc/
 
 ## IDE: Cursor
 .cursor/
+
+## MATLAB generated logs
+matlab_logs/
