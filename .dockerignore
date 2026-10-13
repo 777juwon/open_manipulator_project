@@ -1,0 +1,10 @@
+.git
+.github
+build
+install
+log
+docker/workspace
+**/__pycache__
+**/*.pyc
+*.bag
+*.db3
