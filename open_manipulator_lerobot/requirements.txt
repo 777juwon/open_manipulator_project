@@ -1,0 +1,6 @@
+lerobot[dataset]==0.6.1
+torch==2.11.0
+torchvision==0.26.0
+numpy==2.2.6
+av==15.1.0
+datasets==4.8.5

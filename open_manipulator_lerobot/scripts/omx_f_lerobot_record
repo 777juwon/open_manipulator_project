@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+
+import argparse
+from pathlib import Path
+import signal
+import sys
+import threading
+
+import numpy as np
+import rclpy
+from control_msgs.action import GripperCommand
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, JointState
+from trajectory_msgs.msg import JointTrajectory
+
+
+ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5']
+STATE_NAMES = ARM_JOINTS + ['gripper_joint_1']
+CAMERA_KEY = 'observation.images.wrist'
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Record OMX-F data as LeRobotDataset v3')
+    parser.add_argument('--dataset-root', default='/workspace/lerobot_datasets/omx_f_pick_place')
+    parser.add_argument('--repo-id', default='local/omx_f_pick_place')
+    parser.add_argument('--task', default='Pick up the red cube and place it in the blue box')
+    parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--image-topic', default='/omx_f/wrist_camera/image_raw')
+    return parser.parse_args(rclpy.utilities.remove_ros_args(args=sys.argv)[1:])
+
+
+class OMXLeRobotRecorder(Node):
+    def __init__(self, args):
+        super().__init__('omx_f_lerobot_recorder')
+        self.args = args
+        self.lock = threading.Lock()
+        self.dataset_lock = threading.Lock()
+        self.state = None
+        self.action = None
+        self.image = None
+        self.recording = False
+        self.frames = 0
+        self.stop_requested = False
+
+        root = Path(args.dataset_root)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        features = {
+            'observation.state': {
+                'dtype': 'float32', 'shape': (6,), 'names': STATE_NAMES,
+            },
+            'action': {
+                'dtype': 'float32', 'shape': (6,), 'names': STATE_NAMES,
+            },
+            CAMERA_KEY: {
+                'dtype': 'video', 'shape': (480, 640, 3),
+                'names': ['height', 'width', 'channels'],
+            },
+        }
+        if (root / 'meta' / 'info.json').exists():
+            self.dataset = LeRobotDataset.resume(args.repo_id, root=root)
+            self.get_logger().info(f'Resuming dataset: {root}')
+        else:
+            self.dataset = LeRobotDataset.create(
+                repo_id=args.repo_id,
+                fps=args.fps,
+                root=root,
+                robot_type='omx_f_gazebo',
+                features=features,
+                use_videos=True,
+                image_writer_threads=2,
+            )
+            self.get_logger().info(f'Created LeRobotDataset v3: {root}')
+
+        self.create_subscription(JointState, '/joint_states', self.on_joint_state, 20)
+        self.create_subscription(
+            JointTrajectory, '/arm_controller/joint_trajectory', self.on_arm_command, 20
+        )
+        self.create_subscription(
+            GripperCommand.Impl.SendGoalService.Request,
+            '/gripper_controller/gripper_cmd/_action/goal',
+            self.on_gripper_command,
+            20,
+        )
+        self.create_subscription(Image, args.image_topic, self.on_image, qos_profile_sensor_data)
+        self.create_timer(1.0 / args.fps, self.capture_frame)
+
+        threading.Thread(target=self.keyboard_loop, daemon=True).start()
+        self.print_help()
+
+    def print_help(self):
+        print('\nLeRobot recorder controls')
+        print('  r + Enter : start an episode')
+        print('  s + Enter : save the episode (successful demonstration)')
+        print('  d + Enter : discard the current episode')
+        print('  q + Enter : finalize the dataset and quit\n')
+
+    def on_joint_state(self, msg):
+        positions = dict(zip(msg.name, msg.position))
+        if not all(name in positions for name in STATE_NAMES):
+            return
+        state = np.asarray([positions[name] for name in STATE_NAMES], dtype=np.float32)
+        with self.lock:
+            self.state = state
+            if self.action is None:
+                self.action = state.copy()
+
+    def on_arm_command(self, msg):
+        if not msg.points:
+            return
+        targets = dict(zip(msg.joint_names, msg.points[-1].positions))
+        with self.lock:
+            if self.action is None:
+                return
+            for index, name in enumerate(ARM_JOINTS):
+                if name in targets:
+                    self.action[index] = targets[name]
+
+    def on_gripper_command(self, msg):
+        with self.lock:
+            if self.action is not None:
+                self.action[5] = msg.goal.command.position
+
+    def on_image(self, msg):
+        channels = 4 if msg.encoding.lower() in ('rgba8', 'bgra8') else 3
+        row = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
+        image = row[:, :msg.width * channels].reshape(msg.height, msg.width, channels)
+        encoding = msg.encoding.lower()
+        if encoding in ('bgr8', 'bgra8'):
+            image = image[:, :, [2, 1, 0] + ([3] if channels == 4 else [])]
+        if channels == 4:
+            image = image[:, :, :3]
+        if image.shape[:2] != (480, 640):
+            self.get_logger().error(f'Expected 640x480 image, received {image.shape[1]}x{image.shape[0]}')
+            return
+        with self.lock:
+            self.image = np.ascontiguousarray(image)
+
+    def capture_frame(self):
+        with self.lock:
+            if not self.recording or self.state is None or self.action is None or self.image is None:
+                return
+            frame = {
+                'observation.state': self.state.copy(),
+                'action': self.action.copy(),
+                CAMERA_KEY: self.image.copy(),
+                'task': self.args.task,
+            }
+        with self.dataset_lock:
+            self.dataset.add_frame(frame)
+        self.frames += 1
+        if self.frames % self.args.fps == 0:
+            self.get_logger().info(f'Recording: {self.frames} frames ({self.frames / self.args.fps:.1f} s)')
+
+    def keyboard_loop(self):
+        while not self.stop_requested:
+            try:
+                command = input().strip().lower()
+            except EOFError:
+                return
+            if command == 'r':
+                if self.recording:
+                    print('Already recording.')
+                elif self.state is None or self.image is None:
+                    print('Waiting for /joint_states and wrist camera image...')
+                else:
+                    self.frames = 0
+                    self.recording = True
+                    print('Episode recording started.')
+            elif command == 's':
+                self.finish_episode(save=True)
+            elif command == 'd':
+                self.finish_episode(save=False)
+            elif command == 'q':
+                if self.recording:
+                    print('Finish the episode with s or d before quitting.')
+                else:
+                    self.stop_requested = True
+            elif command:
+                self.print_help()
+
+    def finish_episode(self, save):
+        if not self.recording:
+            print('No episode is being recorded.')
+            return
+        self.recording = False
+        if save and self.frames > 0:
+            print(f'Encoding and saving {self.frames} frames...')
+            with self.dataset_lock:
+                self.dataset.save_episode()
+            print('Episode saved.')
+        else:
+            with self.dataset_lock:
+                self.dataset.clear_episode_buffer()
+            print('Episode discarded.')
+        self.frames = 0
+
+    def finalize(self):
+        if self.recording:
+            self.recording = False
+            with self.dataset_lock:
+                self.dataset.clear_episode_buffer()
+            print('Incomplete episode discarded.')
+        print('Finalizing LeRobotDataset...')
+        with self.dataset_lock:
+            self.dataset.finalize()
+        print(f'Dataset ready at: {self.args.dataset_root}')
+
+
+def main():
+    args = parse_args()
+    rclpy.init()
+    node = OMXLeRobotRecorder(args)
+
+    def request_stop(*_):
+        node.stop_requested = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        while rclpy.ok() and not node.stop_requested:
+            rclpy.spin_once(node, timeout_sec=0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.finalize()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+
+"""Automatically collect 50 Gazebo pick-and-place demonstrations.
+
+The node deliberately uses only information that is known by the simulator:
+the cube/bin poses and the OMX-F link dimensions.  It is not intended for a
+real robot.
+"""
+
+import argparse
+import colorsys
+import math
+from pathlib import Path
+import re
+import random
+import subprocess
+import sys
+import threading
+import time
+
+from control_msgs.action import FollowJointTrajectory
+from action_msgs.msg import GoalStatus
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+import numpy as np
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, JointState
+from trajectory_msgs.msg import JointTrajectoryPoint
+
+
+ARM_JOINTS = ['joint1', 'joint2', 'joint3', 'joint4', 'joint5']
+STATE_NAMES = ARM_JOINTS + ['gripper_joint_1']
+CAMERA_KEY = 'observation.images.wrist'
+WORLD = 'omx_f_pick_place'
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Collect randomized Gazebo episodes as LeRobotDataset v3')
+    parser.add_argument('--dataset-root',
+                        default='/workspace/lerobot_datasets/omx_f_auto_pick_place_50')
+    parser.add_argument('--repo-id', default='local/omx_f_auto_pick_place_50')
+    parser.add_argument('--task', default='Pick up the red cube and place it in the blue box')
+    parser.add_argument('--fps', type=int, default=30)
+    parser.add_argument('--episodes', type=int, default=50,
+                        help='Number of successful randomized episodes to save')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Randomization seed; resume reproduces episode settings')
+    parser.add_argument('--motion-duration', type=float, default=1.4)
+    parser.add_argument('--settle-time', type=float, default=0.5)
+    parser.add_argument('--max-attempts', type=int, default=5,
+                        help='Stop after this many failed attempts for one episode')
+    parser.add_argument('--image-topic', default='/omx_f/wrist_camera/image_raw')
+    parser.add_argument('--resume', action='store_true',
+                        help='Continue an interrupted dataset instead of requiring a fresh path')
+    return parser.parse_args(rclpy.utilities.remove_ros_args(args=sys.argv)[1:])
+
+
+class AutoCollector(Node):
+    def __init__(self, args):
+        super().__init__('omx_f_auto_collector')
+        self.args = args
+        self.data_lock = threading.Lock()
+        self.dataset_lock = threading.Lock()
+        self.state = None
+        self.image = None
+        self.action = np.zeros(6, dtype=np.float32)
+        self.recording = False
+        self.frames = 0
+        self.cube_visual_id = None
+        self.cube_link_id = None
+
+        root = Path(args.dataset_root)
+        info = root / 'meta' / 'info.json'
+        if info.exists() and not args.resume:
+            raise RuntimeError(
+                f'Dataset already exists at {root}. Use --resume to continue it, '
+                'or select a new --dataset-root.')
+        root.parent.mkdir(parents=True, exist_ok=True)
+        if info.exists():
+            self.dataset = LeRobotDataset.resume(args.repo_id, root=root)
+            self.start_episode = int(self.dataset.num_episodes)
+            self.get_logger().info(f'Resuming at episode {self.start_episode}')
+        else:
+            features = {
+                'observation.state': {
+                    'dtype': 'float32', 'shape': (6,), 'names': STATE_NAMES,
+                },
+                'action': {
+                    'dtype': 'float32', 'shape': (6,), 'names': STATE_NAMES,
+                },
+                CAMERA_KEY: {
+                    'dtype': 'video', 'shape': (480, 640, 3),
+                    'names': ['height', 'width', 'channels'],
+                },
+            }
+            self.dataset = LeRobotDataset.create(
+                repo_id=args.repo_id, fps=args.fps, root=root,
+                robot_type='omx_f_gazebo', features=features, use_videos=True,
+                image_writer_threads=2)
+            self.start_episode = 0
+
+        self.arm_client = ActionClient(
+            self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
+        self.gripper_client = ActionClient(
+            self, FollowJointTrajectory,
+            '/gripper_controller/follow_joint_trajectory')
+        self.create_subscription(JointState, '/joint_states', self.on_joint_state, 20)
+        self.create_subscription(Image, args.image_topic, self.on_image,
+                                 qos_profile_sensor_data)
+        self.create_timer(1.0 / args.fps, self.capture_frame)
+
+    def on_joint_state(self, msg):
+        positions = dict(zip(msg.name, msg.position))
+        if not all(name in positions for name in STATE_NAMES):
+            return
+        state = np.asarray([positions[name] for name in STATE_NAMES], dtype=np.float32)
+        with self.data_lock:
+            self.state = state
+
+    def on_image(self, msg):
+        encoding = msg.encoding.lower()
+        channels = 4 if encoding in ('rgba8', 'bgra8') else 3
+        try:
+            rows = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
+            image = rows[:, :msg.width * channels].reshape(msg.height, msg.width, channels)
+        except ValueError:
+            self.get_logger().error('Invalid camera image buffer')
+            return
+        if encoding in ('bgr8', 'bgra8'):
+            image = image[:, :, [2, 1, 0] + ([3] if channels == 4 else [])]
+        image = image[:, :, :3]
+        if image.shape != (480, 640, 3):
+            self.get_logger().error(f'Expected 640x480 RGB, got {image.shape}')
+            return
+        with self.data_lock:
+            self.image = np.ascontiguousarray(image)
+
+    def capture_frame(self):
+        with self.data_lock:
+            if not self.recording or self.state is None or self.image is None:
+                return
+            frame = {
+                'observation.state': self.state.copy(),
+                'action': self.action.copy(),
+                CAMERA_KEY: self.image.copy(),
+                'task': self.args.task,
+            }
+        with self.dataset_lock:
+            self.dataset.add_frame(frame)
+        self.frames += 1
+
+    @staticmethod
+    def inverse_kinematics(x, y, z, tool_angle=-0.65):
+        """Closed-form OMX-F IK; tool_angle is elevation of its forward axis."""
+        # Joint-1 is offset 11.25 mm from the world origin in x.
+        radial = math.hypot(x + 0.01125, y)
+        q1 = math.atan2(y, x + 0.01125)
+        shoulder_z = 0.034 + 0.0635
+        first = math.hypot(0.0415, 0.11315)
+        first_angle = math.atan2(0.11315, 0.0415)
+        second = 0.162
+        tool = 0.0287 + 0.09193
+
+        wrist_x = radial - tool * math.cos(tool_angle)
+        wrist_z = z - tool * math.sin(tool_angle) - shoulder_z
+        cosine = ((wrist_x * wrist_x + wrist_z * wrist_z - first * first - second * second)
+                  / (2.0 * first * second))
+        if not -1.0 <= cosine <= 1.0:
+            raise ValueError(f'Unreachable pose x={x:.3f}, y={y:.3f}, z={z:.3f}')
+        relative = -math.acos(max(-1.0, min(1.0, cosine)))
+        theta1 = (math.atan2(wrist_z, wrist_x)
+                  - math.atan2(second * math.sin(relative),
+                               first + second * math.cos(relative)))
+        theta2 = theta1 + relative
+        q2 = first_angle - theta1
+        q3 = -theta2 - q2
+        # Planar tool elevation equals -(q2 + q3 + q4).
+        q4 = -tool_angle - q2 - q3
+        return [q1, q2, q3, q4, 0.0]
+
+    def wait_until_ready(self):
+        self.get_logger().info('Waiting for controllers, joint states, and camera...')
+        if not self.arm_client.wait_for_server(timeout_sec=30.0):
+            raise RuntimeError('Arm action server is unavailable')
+        if not self.gripper_client.wait_for_server(timeout_sec=30.0):
+            raise RuntimeError('Gripper action server is unavailable')
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            with self.data_lock:
+                if self.state is not None and self.image is not None:
+                    return
+            time.sleep(0.1)
+        raise RuntimeError('Timed out waiting for joint states or wrist-camera images')
+
+    def move_arm(self, joints, duration=None):
+        duration = self.args.motion_duration if duration is None else duration
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = ARM_JOINTS
+        point = JointTrajectoryPoint()
+        point.positions = [float(value) for value in joints]
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+        goal.trajectory.points = [point]
+        with self.data_lock:
+            self.action[:5] = joints
+        sent = self.wait_future(self.arm_client.send_goal_async(goal), 5.0,
+                                'sending arm trajectory')
+        if not sent.accepted:
+            raise RuntimeError('Arm trajectory was rejected')
+        result = self.wait_future(sent.get_result_async(), duration + 8.0,
+                                  'executing arm trajectory')
+        if result.status != GoalStatus.STATUS_SUCCEEDED:
+            raise RuntimeError(f'Arm trajectory failed with status {result.status}')
+
+    def move_gripper(self, position):
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = ['gripper_joint_1', 'gripper_joint_2']
+        point = JointTrajectoryPoint()
+        point.positions = [float(position), -float(position)]
+        point.time_from_start.sec = 1
+        goal.trajectory.points = [point]
+        with self.data_lock:
+            self.action[5] = position
+        sent = self.wait_future(self.gripper_client.send_goal_async(goal), 5.0,
+                                'sending gripper command')
+        if not sent.accepted:
+            raise RuntimeError('Gripper command was rejected')
+        result = self.wait_future(sent.get_result_async(), 5.0,
+                                  'executing gripper command')
+        if result.status != GoalStatus.STATUS_SUCCEEDED:
+            raise RuntimeError(f'Gripper command failed with status {result.status}')
+
+    @staticmethod
+    def wait_future(future, timeout, operation):
+        deadline = time.monotonic() + timeout
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise RuntimeError(f'Timed out while {operation}')
+        exception = future.exception()
+        if exception is not None:
+            raise RuntimeError(f'Failed while {operation}: {exception}')
+        return future.result()
+
+    @staticmethod
+    def gz_request(service, request_type, request):
+        command = [
+            'gz', 'service', '-s', service,
+            '--reqtype', request_type,
+            '--reptype', 'gz.msgs.Boolean',
+            '--timeout', '5000', '--req', request,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=8.0)
+        output = result.stdout + result.stderr
+        if result.returncode != 0 or 'data: true' not in output.lower():
+            raise RuntimeError(f'Gazebo service failed: {service}\n{output.strip()}')
+
+    def set_cube_pose(self, x, y):
+        request = (f'name: "pick_cube", position: {{x: {x}, y: {y}, z: 0.035}}, '
+                   'orientation: {w: 1.0}')
+        self.gz_request(f'/world/{WORLD}/set_pose', 'gz.msgs.Pose', request)
+
+    def set_light(self, intensity):
+        # Light configuration is handled by Gazebo's UserCommands system.
+        request = (f'name: "sun", type: DIRECTIONAL, intensity: {intensity}, '
+                   'direction: {x: -0.5, y: 0.2, z: -0.9}, '
+                   'diffuse: {r: 0.9, g: 0.9, b: 0.9, a: 1.0}, '
+                   'specular: {r: 0.2, g: 0.2, b: 0.2, a: 1.0}')
+        self.gz_request(f'/world/{WORLD}/light_config', 'gz.msgs.Light', request)
+
+    def find_cube_visual(self):
+        if self.cube_visual_id is not None:
+            return
+        result = subprocess.run([
+            'gz', 'service', '-s', f'/world/{WORLD}/scene/info',
+            '--reqtype', 'gz.msgs.Empty', '--reptype', 'gz.msgs.Scene',
+            '--timeout', '5000', '--req', '',
+        ], capture_output=True, text=True, timeout=8.0)
+        output = result.stdout + result.stderr
+        match = re.search(
+            r'model\s*\{\s*name:\s*"pick_cube".*?link\s*\{\s*id:\s*(\d+)'
+            r'.*?visual\s*\{\s*name:\s*"visual"\s*id:\s*(\d+)',
+            output, re.DOTALL)
+        if result.returncode != 0 or match is None:
+            raise RuntimeError(f'Could not find the cube visual entity:\n{output.strip()}')
+        self.cube_link_id = int(match.group(1))
+        self.cube_visual_id = int(match.group(2))
+
+    def set_cube_color(self, color):
+        self.find_cube_visual()
+        r, g, b = color
+        request = (
+            f'id: {self.cube_visual_id}, parent_id: {self.cube_link_id}, '
+            f'material: {{ambient: {{r: {r}, g: {g}, b: {b}, a: 1.0}}, '
+            f'diffuse: {{r: {r}, g: {g}, b: {b}, a: 1.0}}, '
+            'specular: {r: 0.2, g: 0.2, b: 0.2, a: 1.0}}')
+        self.gz_request(f'/world/{WORLD}/visual_config', 'gz.msgs.Visual', request)
+
+    def episode_randomization(self, episode):
+        # A per-episode RNG makes --resume reproduce the same episode setup.
+        rng = random.Random(self.args.seed + episode)
+        x = rng.uniform(0.255, 0.300)
+        y = rng.uniform(-0.015, 0.075)
+        hue = rng.random()
+        saturation = rng.uniform(0.65, 0.95)
+        value = rng.uniform(0.70, 0.95)
+        color = colorsys.hsv_to_rgb(hue, saturation, value)
+        light = rng.uniform(0.70, 1.30)
+        return {'cube': (x, y), 'color': color, 'light': light}
+
+    @staticmethod
+    def get_cube_pose():
+        """Return the cube XYZ reported by Gazebo, not the commanded pose."""
+        result = subprocess.run(
+            ['gz', 'model', '-m', 'pick_cube', '-p'],
+            capture_output=True, text=True, timeout=8.0)
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise RuntimeError(f'Could not read cube pose:\n{output.strip()}')
+        matches = re.findall(
+            r'^\s*\[\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+'
+            r'(-?\d+(?:\.\d+)?)\s*\]\s*$', output, re.MULTILINE)
+        if not matches:
+            raise RuntimeError(f'Could not parse cube pose:\n{output.strip()}')
+        return tuple(float(value) for value in matches[0])
+
+    def require_cube_lifted(self):
+        x, y, z = self.get_cube_pose()
+        self.get_logger().info(f'Cube after lift: x={x:.3f}, y={y:.3f}, z={z:.3f}')
+        if z < 0.060:
+            raise RuntimeError(
+                f'GRASP_FAILED: cube was not lifted (z={z:.3f} m)')
+
+    def require_cube_in_bin(self):
+        x, y, z = self.get_cube_pose()
+        self.get_logger().info(f'Cube after place: x={x:.3f}, y={y:.3f}, z={z:.3f}')
+        # The bin inner area is about x=[0.23, 0.41], y=[-0.23, -0.09].
+        # Apply a cube-radius margin so touching/straddling a wall is rejected.
+        inside = 0.255 <= x <= 0.385 and -0.205 <= y <= -0.115 and 0.020 <= z <= 0.130
+        if not inside:
+            raise RuntimeError(
+                f'PLACE_FAILED: cube is outside the bin (x={x:.3f}, '
+                f'y={y:.3f}, z={z:.3f})')
+
+    def perform_pick_place(self, cube_x, cube_y):
+        # Approach along the tool axis, grasp the cube centre, retreat, then
+        # release above the bin centre.  The tilted grasp is required because
+        # a vertical wrist pose at the table edge is outside OMX-F reach.
+        angle = -0.65
+        distance = 0.085
+        approach_x = cube_x - distance * math.cos(angle)
+        approach_y = cube_y * (approach_x + 0.01125) / (cube_x + 0.01125)
+        # The SDF starts the cube at z=0.035, but physics settles its 50 mm
+        # body on the table at centre z=0.025.  Aim at that actual centre.
+        grasp_z = 0.026
+        approach_z = grasp_z - distance * math.sin(angle)
+        approach = self.inverse_kinematics(approach_x, approach_y, approach_z, angle)
+        grasp = self.inverse_kinematics(cube_x, cube_y, grasp_z, angle)
+        place = self.inverse_kinematics(0.320, -0.160, 0.175, -0.20)
+
+        self.move_gripper(1.0)       # open
+        self.move_arm(approach)
+        self.move_arm(grasp, 1.0)
+        self.move_gripper(0.0)       # close
+        time.sleep(self.args.settle_time)
+        self.move_arm(approach)
+        time.sleep(self.args.settle_time)
+        self.require_cube_lifted()
+        self.move_arm(place, 1.8)
+        self.move_gripper(1.0)       # release into bin
+        time.sleep(self.args.settle_time)
+        self.move_arm([0.0, -0.65, 1.15, 0.70, 0.0])
+        time.sleep(self.args.settle_time)
+        self.require_cube_in_bin()
+
+    def recover_after_failure(self):
+        """Move away before resetting the cube for another attempt."""
+        try:
+            self.move_gripper(1.0)
+            self.move_arm([0.0, -0.65, 1.15, 0.70, 0.0], 1.5)
+        except Exception as error:
+            self.get_logger().warning(f'Recovery motion reported: {error}')
+
+    def run_collection(self):
+        total = self.args.episodes
+        if self.start_episode >= total:
+            self.get_logger().info(f'Dataset already contains the requested {total} episodes')
+            return
+        self.wait_until_ready()
+        self.move_gripper(1.0)
+        self.move_arm([0.0, -0.65, 1.15, 0.70, 0.0])
+
+        episode = self.start_episode
+        while episode < total:
+            condition = self.episode_randomization(episode)
+            saved = False
+            for attempt in range(1, self.args.max_attempts + 1):
+                x, y = condition['cube']
+                r, g, b = condition['color']
+                self.get_logger().info(
+                    f'Episode {episode + 1}/{total}: attempt '
+                    f'{attempt}/{self.args.max_attempts}, cube=({x:.3f}, {y:.3f}), '
+                    f'RGB=({r:.2f}, {g:.2f}, {b:.2f}), light={condition["light"]:.2f}')
+                self.set_light(condition['light'])
+                self.set_cube_color(condition['color'])
+                self.set_cube_pose(*condition['cube'])
+                time.sleep(self.args.settle_time)
+
+                self.frames = 0
+                self.recording = True
+                try:
+                    self.perform_pick_place(*condition['cube'])
+                except Exception as error:
+                    self.recording = False
+                    with self.dataset_lock:
+                        self.dataset.clear_episode_buffer()
+                    self.get_logger().warning(
+                        f'Attempt rejected; no data saved: {error}')
+                    self.recover_after_failure()
+                    continue
+                self.recording = False
+                if self.frames == 0:
+                    raise RuntimeError('No frames were recorded')
+                with self.dataset_lock:
+                    self.dataset.save_episode()
+                self.get_logger().info(
+                    f'SUCCESS: saved episode {episode + 1} ({self.frames} frames)')
+                saved = True
+                episode += 1
+                break
+            if not saved:
+                raise RuntimeError(
+                    f'Collection stopped: randomized episode {episode + 1} failed '
+                    f'{self.args.max_attempts} times. No failed attempt was saved.')
+
+    def finalize(self):
+        self.recording = False
+        with self.dataset_lock:
+            self.dataset.finalize()
+
+
+def main():
+    args = parse_args()
+    rclpy.init()
+    node = AutoCollector(args)
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    failed = False
+    try:
+        node.run_collection()
+    except KeyboardInterrupt:
+        node.get_logger().warning('Interrupted; the incomplete episode will be discarded')
+        with node.dataset_lock:
+            node.dataset.clear_episode_buffer()
+    except Exception as error:
+        failed = True
+        node.get_logger().error(str(error))
+    finally:
+        node.finalize()
+        executor.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        spin_thread.join(timeout=2.0)
+    if failed:
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

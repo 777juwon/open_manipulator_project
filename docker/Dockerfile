@@ -48,7 +48,19 @@ RUN apt-get update && apt-get install -y \
     vim \
     nano \
     python3-pip \
+    python3-venv \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep the ML environment inside the image. /workspace is a host volume and
+# therefore must not contain software required for reproducibility.
+COPY open_manipulator_lerobot/requirements.txt /tmp/lerobot-requirements.txt
+RUN python3 -m venv --system-site-packages /opt/lerobot_venv && \
+    /opt/lerobot_venv/bin/python -m pip install --no-cache-dir --upgrade pip && \
+    /opt/lerobot_venv/bin/python -m pip install --no-cache-dir \
+      -r /tmp/lerobot-requirements.txt && \
+    rm -f /tmp/lerobot-requirements.txt
+ENV PATH="/opt/lerobot_venv/bin:${PATH}"
 
 ENV COLCON_WS=/root/ros2_ws
 WORKDIR ${COLCON_WS}
@@ -58,10 +70,13 @@ RUN mkdir -p ${COLCON_WS}/src && \
     git clone -b jazzy https://github.com/ROBOTIS-GIT/dynamixel_hardware_interface.git && \
     git clone -b jazzy https://github.com/ROBOTIS-GIT/dynamixel_interfaces.git && \
     git clone -b jazzy https://github.com/ROBOTIS-GIT/DynamixelSDK.git && \
-    git clone -b jazzy https://github.com/ROBOTIS-GIT/open_manipulator.git && \
     git clone -b jazzy https://github.com/ROBOTIS-GIT/robotis_interfaces.git && \
     git clone -b r/4.56.4 https://github.com/IntelRealSense/realsense-ros.git && \
     cd realsense-ros && git checkout cbd8b8487d4c0126bb590822db9469414496e62a
+
+# Build the exact project revision checked out by the user, rather than cloning
+# another OpenMANIPULATOR revision inside the image.
+COPY . ${COLCON_WS}/src/open_manipulator/
 
 RUN cd ${COLCON_WS} && \
     apt-get update && \

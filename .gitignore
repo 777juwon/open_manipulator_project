@@ -181,6 +181,12 @@ venv.bak/
 ## mkdocs documentation
 /site
 
+# ROS 2 and local dataset artifacts
+/build/
+/install/
+/log/
+/docker/workspace/
+
 ## mypy
 .mypy_cache/
 

@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>open_manipulator_lerobot</name>
+  <version>0.1.0</version>
+  <description>Record OMX-F ROS 2 simulation data directly as LeRobotDataset v3.</description>
+  <maintainer email="user@example.com">OMX-F user</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
