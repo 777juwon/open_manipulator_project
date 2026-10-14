@@ -21,6 +21,12 @@ To use the Docker image for running ROS packages and Physical AI tools with the 
 
 ## OMX-F Gazebo LeRobot dataset collection
 
+Fast DDS 자동 설정과 MATLAB 관절/FK 기록을 포함한 에피소드 1개 테스트는
+[Gazebo와 MATLAB 검증](docs/one_episode_matlab_validation.md)을 참고하세요.
+
+수집 후 에피소드별 관절 데이터, 메타데이터와 영상 파일을 자동 검사하는 방법은
+[LeRobot Dataset 품질 점검](docs/episode_dataset_quality.md)을 참고하세요.
+
 This repository includes a reproducible ROS 2 Jazzy, Gazebo, and LeRobot 0.6.1
 environment for collecting successful OMX-F pick-and-place demonstrations.
 Every saved episode randomizes the cube position, cube color, and light
