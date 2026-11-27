@@ -543,3 +543,8 @@ doc/
 
 ## MATLAB generated logs
 matlab_logs/
+
+# 로컬 음성 인식 환경과 실험 원본·자동 생성 보고서
+/.venv_whisper/
+/voice_logs/
+/reports/rollout_audit_20261119/

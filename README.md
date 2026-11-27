@@ -19,6 +19,22 @@ To access datasets and pre-trained models for our open-source platforms, see:
 To use the Docker image for running ROS packages and Physical AI tools with the OpenMANIPULATOR, visit:
   - [Docker Images](https://hub.docker.com/r/robotis/ros/tags)
 
+## 실물 OMX LeRobot 실행
+
+Docker 준비, USB 장치 설정, Teleoperation, 카메라 기록과 모델 평가 안내입니다.
+
+| 작업 | 문서 |
+| --- | --- |
+| 실물 연결과 데이터 기록 | [실물 OMX LeRobot 실행](docs/omx_real_lerobot_workflow.md) |
+| 실제 수집 시각과 두 카메라 수집 | [데이터 수집 시간 검증](docs/omx_record_timing.md) |
+| 데이터 선택, LoRA 학습, 단일·두 카메라 모델 실행 | [SmolVLA 학습과 실행](docs/omx_100ep_lora.md) |
+| 통신 및 실행 지연 분석 | [실행 진단](docs/omx_rollout_diagnostics.md) |
+| 관절·영상 기록과 수동 성공·실패 평가 | [모델 실행 기록](docs/omx_rollout_recording.md) |
+| 실물 실행과 tele 시연 비교 | [MATLAB 분석](docs/omx_matlab_real_comparison.md) |
+
+가상환경, 데이터셋, 모델 가중치, 음성 원본과 생성된 분석 산출물은 Git에 포함하지 않습니다.
+실제 로봇 실행·설치·빌드·학습은 문서의 실행 위치와 장치 경로를 확인한 뒤 수행하세요.
+
 ## OMX-F Gazebo LeRobot dataset collection
 
 Fast DDS 자동 설정과 MATLAB 관절/FK 기록을 포함한 에피소드 1개 테스트는
